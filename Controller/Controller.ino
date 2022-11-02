@@ -6,7 +6,12 @@
 #include <SPI.h>
 #include <Wire.h>
 
-#include "auth.h"
+#include "Auth.h"
+
+// Debug Tools
+#define DEBUG      0
+#define DBGln(...) DEBUG == 1 ? Serial.println(__VA_ARGS__) : NULL
+#define DBGf(...)  DEBUG == 1 ? Serial.printf(__VA_ARGS__) : NULL
 
 // Button Assignments
 #define DISPLAY_BUTTON_PIN D5
@@ -31,27 +36,34 @@
 int status = 0;
 
 // Info about one qbittorrent instance.
-struct Host
+typedef struct
 {
-  const char *name;
-  const char *address;
+  const char* name;
+  const char* pause;
+  const char* resume;
+  const char* query;
+} URL;
 
-  size_t dl_speed;
-  size_t ul_speed;
+typedef struct
+{
+  const URL* urls;
+  size_t     dl_speed;
+  size_t     ul_speed;
+} Host;
 
-  // TODO: Need to rework the qbit api to return smaller JSON responses for
-  // these.
-  size_t paused;
-  size_t resumed;
+#define HOST(name, addr)                            \
+  {                                                 \
+    name, addr "/api/v2/torrents/pause?hashes=all", \
+        addr "/api/v2/torrents/resume?hashes=all",  \
+        addr "/api/v2/transfer/info",               \
+  }
+
+static const URL urls[] = {
+    HOST("Gen", "http://" USERNAME ":" PASSWORD "@10.0.0.3:9091"),
+    HOST("PvT", "http://" USERNAME ":" PASSWORD "@10.0.0.3:9092"),
 };
-
-// Some basic info about each of the hosts.
-static struct Host hosts[] = {
-    {"Gen", "http://" USERNAME ":" PASSWORD "@10.0.0.3:9091", 0, 0, 0, 0},
-    {"PvT", "http://" USERNAME ":" PASSWORD "@10.0.0.3:9092", 0, 0, 0, 0},
-};
-// Compile-time :D
-const int numHosts = sizeof(hosts) / sizeof(hosts[0]);
+#define numHosts (sizeof(urls) / sizeof(urls[0]))
+static Host hosts[numHosts] = {0};
 
 // Interrupt handlers
 enum Actions
@@ -68,9 +80,6 @@ void ICACHE_RAM_ATTR displayISR();
 // 128 x 96 OLED Display
 Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 volatile boolean displayOn = 1;
-
-// JSON Parsing, just reuse a global one.
-StaticJsonDocument<LARGE_BUF_SIZE> JSONBuffer;
 
 /*
  * Draw an entire 'frame' to the display with all the necessary UI elements.
@@ -114,8 +123,6 @@ void drawUI()
   }
 
   // Draw the hosts in a somewhat tabular way.
-  // TODO: Determine if there is a printf equivalent to this.
-  // TODO: Or just use a buffer with sprintf.
   oled.setCursor(0, 8);
   oled.println("Name   DL    UL");
   for (int i = 0; i < numHosts; i++)
@@ -123,7 +130,7 @@ void drawUI()
     snprintf(rowBuf,
              SCREEN_WIDTH,
              "%3s %5u %5u\n",
-             hosts[i].name,
+             hosts[i].urls->name,
              hosts[i].dl_speed,
              hosts[i].ul_speed);
     oled.print(rowBuf);
@@ -136,26 +143,23 @@ void drawUI()
  *
  * Essentially can be used to perform a pause or resume action on all torrents.
  *
- * @param host: Base address for GET request.
- * @param action: Either "pause" or "resume" to apply to all torrents.
+ * @param hostURLs: Ptr to URLs for specific host.
+ * @param action: Either "PAUSE" or "RESUME" to apply to all torrents.
  */
-void performAction(const char *host, const char *action)
+void performAction(const URL* hostURLs, const int action)
 {
   WiFiClient client;
   HTTPClient http;
 
-  char buffer[BUF_SIZE];
-  sprintf(buffer, "%s/api/v2/torrents/%s?hashes=all", host, action);
+  const char* url = action == PAUSE ? hostURLs->pause : hostURLs->resume;
 
-  if (http.begin(client, buffer))
+  if (http.begin(client, url))
   {
-    Serial.printf("[TOGGLE] GET: %s\n", buffer);
     int httpCode = http.GET();
     http.end();
     if (httpCode < 0)
     {
-      Serial.printf("[TOGGLE] FAIL... code: %s\n",
-                    http.errorToString(httpCode).c_str());
+      DBGf("[TOGGLE] FAIL... code: %s\n", http.errorToString(httpCode).c_str());
       return;
     }
   }
@@ -167,13 +171,13 @@ void performAction(const char *host, const char *action)
  * Essentially can be used to perform a pause or resume action on all torrents
  * across all hosts.
  *
- * @param action: Either "pause" or "resume" to apply to all torrents.
+ * @param action: Either "PAUSE" or "RESUME" to apply to all torrents.
  */
-void performAction(const char *action)
+void performAction(const int action)
 {
   for (int i = 0; i < numHosts; i++)
   {
-    performAction(hosts[i].address, action);
+    performAction(&urls[i], action);
   }
 }
 
@@ -184,42 +188,43 @@ void performAction(const char *action)
  *
  * @param host: Which host to query and where to store results.
  */
-void query(struct Host *host)
+void query(Host* host)
 {
   WiFiClient client;
   HTTPClient http;
 
-  char                 endpoint[BUF_SIZE];
-  char                 buffer[LARGE_BUF_SIZE];
-  int                  httpCode;
-  String               payload;
-  DeserializationError error;
+  char   buffer[LARGE_BUF_SIZE];
+  int    httpCode;
+  String payload;
+
+  StaticJsonDocument<384> doc;
+  DeserializationError    error;
 
   /* ---------- Transfer Rates ---------- */
-  sprintf(buffer, "%s/api/v2/transfer/info", host->address);
-  http.begin(client, buffer);
+  const char* query_addr = host->urls->query;
+  http.begin(client, query_addr);
   httpCode = http.GET();
   if (httpCode < 0)
   {
-    Serial.printf("[QUERY] FAIL... code: %s\n",
-                  http.errorToString(httpCode).c_str());
+    DBGf("[QUERY] FAIL... code: %s\n", http.errorToString(httpCode).c_str());
     // TODO: Propogate error!
     return;
   }
+
   payload = http.getString();
   http.end();
 
-  error = deserializeJson(JSONBuffer, payload);
+  error = deserializeJson(doc, payload);
   if (error)
   {
-    Serial.println("[QUERY] Fail parsing payload");
-    Serial.printf("[QUERY] %s\n", error.c_str());
-    // TODO: Propogate error!
     return;
   }
 
-  host->dl_speed = (size_t)JSONBuffer["dl_info_speed"] / 1000;
-  host->ul_speed = (size_t)JSONBuffer["up_info_speed"] / 1000;
+  const long long dl_speed = doc["dl_info_speed"];
+  const long long ul_speed = doc["up_info_speed"];
+
+  host->dl_speed = dl_speed / 1000;
+  host->ul_speed = ul_speed / 1000;
 }
 
 /*
@@ -299,19 +304,25 @@ void waitForWiFi()
   oled.clearDisplay();
   oled.display();
 
-  Serial.printf("\n[WiFi] Connected to %s\n", SSID);
+  DBGf("\n[WiFi] Connected to %s\n", SSID);
   Serial.print(F("[WiFi] IP: "));
-  Serial.println(WiFi.localIP());
+  DBGln(WiFi.localIP());
 }
 
 void setup()
 {
+#if DEBUG
   Serial.begin(9600);
   Serial.setDebugOutput(true);
-  Serial.println();
-  Serial.println();
-  Serial.println();
-  Serial.println();
+#endif
+  DBGln("\n\n\n");
+
+  for (unsigned i = 0; i < numHosts; ++i)
+  {
+    hosts[i].urls     = &urls[i];
+    hosts[i].dl_speed = 0;
+    hosts[i].ul_speed = 0;
+  }
 
   // Setup the pins
   pinMode(DISPLAY_BUTTON_PIN, INPUT_PULLUP);
@@ -328,7 +339,7 @@ void setup()
   Wire.begin(SDA, SCL);
   if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C))
   {
-    Serial.println(F("SSD1306 allocation failed"));
+    DBGln(F("SSD1306 allocation failed"));
     for (;;)
       ;
   }
@@ -348,16 +359,10 @@ void loop()
     waitForWiFi();
   }
 
-  if (action == PAUSE)
+  if (action != NONE)
   {
-    status = PAUSE;
-    performAction("pause");
-    action = NONE;
-  }
-  else if (action == RESUME)
-  {
-    status = RESUME;
-    performAction("resume");
+    performAction(action);
+    status = action;
     action = NONE;
   }
 
