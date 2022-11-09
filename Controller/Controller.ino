@@ -8,32 +8,39 @@
 
 #include "Auth.h"
 
+// TODO: Consider integrating all the SSD1306 I2C dependencies directly into
+// this project, so we can take advantage of better (OLED) buffer management.
+
 // Debug Tools
-#define DEBUG      0
-#define DBGln(...) DEBUG == 1 ? Serial.println(__VA_ARGS__) : NULL
-#define DBGf(...)  DEBUG == 1 ? Serial.printf(__VA_ARGS__) : NULL
+#define DEBUG 0
+
+#ifdef DEBUG
+#define DEBUG_println(...) Serial.println(__VA_ARGS__)
+#define DEBUG_printf(...)  Serial.printf(__VA_ARGS__)
+#else
+#define DEBUG_println(...)
+#define DEBUG_printf(...)
+#endif  // DEBUG
 
 // Button Assignments
-#define DISPLAY_BUTTON_PIN D5
-#define START_BUTTON_PIN   D6
-#define STOP_BUTTON_PIN    D7
+#define DISP_BUTTON_PIN  D5
+#define START_BUTTON_PIN D6
+#define STOP_BUTTON_PIN  D7
 
 // OLED Ports
-#define SCL D1
-#define SDA D2
+#define SCL        D1
+#define SDA        D2
+#define OLED_RESET -1
 
 // Misc Constants
 #define SCREEN_WIDTH   128
 #define SCREEN_HEIGHT  64
-#define OLED_RESET     -1
-#define BUF_SIZE       128
-#define LARGE_BUF_SIZE 1024
+#define BUF_SIZE       1024
 #define QUERY_INTERVAL 1000
 
 #define UNKNOWN_STATUS F("UNKNOWN")
 #define SEEDING_STATUS F("SEEDING")
 #define PAUSED_STATUS  F("PAUSED")
-int status = 0;
 
 // Info about one qbittorrent instance.
 typedef struct
@@ -44,6 +51,8 @@ typedef struct
   const char* query;
 } URL;
 
+// Info about the rates of one qbittorrent instance
+// Avoid copying around a bunch of stuff by just having a ptr to URLs.
 typedef struct
 {
   const URL* urls;
@@ -51,6 +60,7 @@ typedef struct
   size_t     ul_speed;
 } Host;
 
+// Convenience macro to generate all the URLs at compile-time.
 #define HOST(name, addr)                            \
   {                                                 \
     name, addr "/api/v2/torrents/pause?hashes=all", \
@@ -59,8 +69,8 @@ typedef struct
   }
 
 static const URL urls[] = {
-    HOST("Gen", "http://" USERNAME ":" PASSWORD "@10.0.0.3:9091"),
-    HOST("PvT", "http://" USERNAME ":" PASSWORD "@10.0.0.3:9092"),
+    HOST("Gen", "http://" USERNAME ":" PASSWORD "@HOST:PORT"),
+    HOST("PvT", "http://" USERNAME ":" PASSWORD "@HOST:PORT"),
 };
 #define numHosts (sizeof(urls) / sizeof(urls[0]))
 static Host hosts[numHosts] = {0};
@@ -69,23 +79,28 @@ static Host hosts[numHosts] = {0};
 enum Actions
 {
   NONE = 0,
+  TOGGLE_DISPLAY,
   PAUSE,
   RESUME,
 };
+static int status = NONE;
+
 volatile int         action;
 void ICACHE_RAM_ATTR pauseISR();
 void ICACHE_RAM_ATTR resumeISR();
 void ICACHE_RAM_ATTR displayISR();
 
-// 128 x 96 OLED Display
+// Display - 128 x 96 OLED
 Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-volatile boolean displayOn = 1;
+volatile bool    displayOn = 1;
 
 /*
  * Draw an entire 'frame' to the display with all the necessary UI elements.
  */
 void drawUI()
 {
+  // TODO: We could be smart about this, and just redraw specifically the
+  // changed elements instead of the entire UI, and save some CPU cycles.
   char rowBuf[SCREEN_WIDTH] = {0};
 
   // Clear and default settings.
@@ -123,6 +138,7 @@ void drawUI()
   }
 
   // Draw the hosts in a somewhat tabular way.
+  // TODO: Find a way to do this without sprintf
   oled.setCursor(0, 8);
   oled.println("Name   DL    UL");
   for (int i = 0; i < numHosts; i++)
@@ -137,6 +153,8 @@ void drawUI()
   }
   oled.display();
 }
+
+/* Qbittorrent API ---------------------------------------------------------- */
 
 /*
  * Perform an HTTP get to "host"/api/v2/torrents/"action"?hashes=all
@@ -159,9 +177,16 @@ void performAction(const URL* hostURLs, const int action)
     http.end();
     if (httpCode < 0)
     {
-      DBGf("[TOGGLE] FAIL... code: %s\n", http.errorToString(httpCode).c_str());
+      /* Erroneous HTTP transaction */
+      DEBUG_printf("[TOGGLE] FAIL: %s\n", http.errorToString(httpCode).c_str());
       return;
     }
+  }
+  else
+  {
+    /* Failed to start HTTP session */
+    DEBUG_printf("[TOGGLE] FAIL: Could not start HTTP session\n");
+    return;
   }
 }
 
@@ -193,10 +218,11 @@ void query(Host* host)
   WiFiClient client;
   HTTPClient http;
 
-  char   buffer[LARGE_BUF_SIZE];
   int    httpCode;
   String payload;
 
+  // We are dealing with fixed size payloads:
+  // https://arduinojson.org/v6/assistant
   StaticJsonDocument<384> doc;
   DeserializationError    error;
 
@@ -206,7 +232,8 @@ void query(Host* host)
   httpCode = http.GET();
   if (httpCode < 0)
   {
-    DBGf("[QUERY] FAIL... code: %s\n", http.errorToString(httpCode).c_str());
+    DEBUG_printf("[QUERY] FAIL... code: %s\n",
+                 http.errorToString(httpCode).c_str());
     // TODO: Propogate error!
     return;
   }
@@ -217,6 +244,7 @@ void query(Host* host)
   error = deserializeJson(doc, payload);
   if (error)
   {
+    // TODO: Propogate error!
     return;
   }
 
@@ -225,12 +253,15 @@ void query(Host* host)
 
   host->dl_speed = dl_speed / 1000;
   host->ul_speed = ul_speed / 1000;
+
+  /* ------------ Statistics ------------ */
+  // TODO: Compute number of active/inactive torrents and such. This may require
+  // proxying the JSON responses from qbittorrent, or writing a homebrew JSON
+  // parser.
 }
 
 /*
- * Query a all qBittorrent hosts to get some more information.
- *
- * Gets current transfer rates.
+ * Query all qBittorrent hosts to get all transfer rates.
  */
 void query()
 {
@@ -240,9 +271,10 @@ void query()
   }
 }
 
+/* ISR ---------------------------------------------------------------------- */
+
 /*
  * Set a flag to pause all the active torrents.
- * The main 'loop' thread will perform this after the ISR terminates.
  */
 void pauseISR()
 {
@@ -251,7 +283,6 @@ void pauseISR()
 
 /*
  * Set a flag to resume all the inactive torrents.
- * The main 'loop' thread will perform this after the ISR terminates.
  */
 void resumeISR()
 {
@@ -259,54 +290,48 @@ void resumeISR()
 }
 
 /*
- * Toggle the display on or off.
+ * Set a flag to toggle the display on or off.
  */
 void displayISR()
 {
   displayOn = !displayOn;
-
-  if (displayOn)
-  {
-    oled.ssd1306_command(SSD1306_DISPLAYON);
-  }
-  else
-  {
-    oled.ssd1306_command(SSD1306_DISPLAYOFF);
-  }
+  action    = TOGGLE_DISPLAY;
 }
+
+/* Main --------------------------------------------------------------------- */
 
 /*
  * Block while blinking the display until a WiFi connection is established.
  */
 void waitForWiFi()
 {
-  Serial.print(F("[WiFi] Waiting"));
+  DEBUG_println("[WiFi] Waiting");
   while (WiFi.status() != WL_CONNECTED)
   {
-    Serial.print(".");
+    /* Blink the screen while connecting to WiFi. */
+    DEBUG_printf(".");
     oled.clearDisplay();
     oled.display();
     delay(500);
 
     oled.setCursor(0, SCREEN_HEIGHT / 2);
-    oled.print(F("Connecting to "));
+    oled.print("Connecting to ");
     oled.print(SSID);
-    oled.println(F("..."));
+    oled.println("...");
     oled.display();
     delay(500);
   }
 
   oled.clearDisplay();
   oled.setCursor(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
-  oled.print(F("Connected to "));
+  oled.print("Connected to ");
   oled.println(SSID);
   delay(1000);
   oled.clearDisplay();
   oled.display();
 
-  DBGf("\n[WiFi] Connected to %s\n", SSID);
-  Serial.print(F("[WiFi] IP: "));
-  DBGln(WiFi.localIP());
+  DEBUG_printf("\n[WiFi] Connected to %s\n", SSID);
+  DEBUG_printf("[WiFi] IP: %s\n", WiFi.localIP());
 }
 
 void setup()
@@ -315,7 +340,7 @@ void setup()
   Serial.begin(9600);
   Serial.setDebugOutput(true);
 #endif
-  DBGln("\n\n\n");
+  DEBUG_println("\n\n\n");
 
   for (unsigned i = 0; i < numHosts; ++i)
   {
@@ -325,21 +350,20 @@ void setup()
   }
 
   // Setup the pins
-  pinMode(DISPLAY_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(DISP_BUTTON_PIN, INPUT_PULLUP);
   pinMode(START_BUTTON_PIN, INPUT_PULLUP);
   pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
 
   // Setup interrupts
-  attachInterrupt(
-      digitalPinToInterrupt(DISPLAY_BUTTON_PIN), displayISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(DISP_BUTTON_PIN), displayISR, RISING);
   attachInterrupt(digitalPinToInterrupt(START_BUTTON_PIN), resumeISR, RISING);
   attachInterrupt(digitalPinToInterrupt(STOP_BUTTON_PIN), pauseISR, RISING);
 
-  // Initialize the OLED
+  // Initialize the OLED over I2C
   Wire.begin(SDA, SCL);
   if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C))
   {
-    DBGln(F("SSD1306 allocation failed"));
+    DEBUG_println(F("SSD1306 allocation failed"));
     for (;;)
       ;
   }
@@ -349,6 +373,7 @@ void setup()
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PSK);
   waitForWiFi();
+
   drawUI();
 }
 
@@ -359,11 +384,25 @@ void loop()
     waitForWiFi();
   }
 
-  if (action != NONE)
+  switch (action)
   {
-    performAction(action);
-    status = action;
-    action = NONE;
+    case NONE:
+      break;
+    case TOGGLE_DISPLAY:
+      if (displayOn)
+      {
+        oled.ssd1306_command(SSD1306_DISPLAYON);
+      }
+      else
+      {
+        oled.ssd1306_command(SSD1306_DISPLAYOFF);
+      }
+      action = NONE;
+      break;
+    default:
+      performAction(action);
+      status = action;
+      action = NONE;
   }
 
   // Only run the continuous queries if the display is on.
