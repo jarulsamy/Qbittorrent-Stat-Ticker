@@ -22,6 +22,8 @@
 #define DEBUG_printf(...)
 #endif  // DEBUG
 
+/* Constants ---------------------------------------------------------------- */
+
 // Button Assignments
 #define DISP_BUTTON_PIN  D5
 #define START_BUTTON_PIN D6
@@ -93,6 +95,8 @@ void ICACHE_RAM_ATTR displayISR();
 // Display - 128 x 96 OLED
 Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 volatile bool    displayOn = 1;
+
+/* UI ----------------------------------------------------------------------- */
 
 /*
  * Draw an entire 'frame' to the display with all the necessary UI elements.
